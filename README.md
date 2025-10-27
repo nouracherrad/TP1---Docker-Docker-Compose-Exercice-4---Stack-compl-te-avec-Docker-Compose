@@ -4,7 +4,7 @@
 This project is a complete fullstack environment that demonstrates how to build a RESTful Flask API connected to PostgreSQL for persistent data storage and Redis for caching.
 It is fully containerized using Docker Compose, with health checks, persistent volumes, and an Adminer UI for database management.
 ##  Project Structure
-![e0](./images/e0.png)
+<img width="482" height="397" alt="image" src="https://github.com/user-attachments/assets/89b71b20-0bec-48fe-856a-e8ab0962ed66" />
 ## File Contents
 ###  app.py
 The main backend logic is written in Flask. It connects to PostgreSQL and Redis, provides CRUD endpoints for users, and includes caching and health checks.
@@ -412,7 +412,7 @@ volumes:
 - Volumes : Persist database and cache data
 - Health checks : Automatically verify container health
 ### Run the Stack
-![e1](./images/e1.png)
+<img width="1062" height="461" alt="image" src="https://github.com/user-attachments/assets/6e19e228-bcea-49d4-b192-25018ccd7639" />
 ### Tests
 *Commandes*
 bash
@@ -420,10 +420,10 @@ docker compose ps
 docker inspect --format="{{json .State.Health}}" fullstack-app-db-1
 docker inspect --format="{{json .State.Health}}" fullstack-app-cache-1
 
-![e4](./images/e4.png)
-![e5](./images/e5.png)
+<img width="1042" height="371" alt="image" src="https://github.com/user-attachments/assets/664d35e4-ab93-42aa-8b56-e72a95624ba7" />
+
 *test with   Postman:*
 - Create a New User
-![e3](./images/e3.png)
+<img width="1017" height="507" alt="image" src="https://github.com/user-attachments/assets/a7eb63a6-669e-4c51-801f-cf09c725f841" />
 - List All Users
-![e2](./images/e2.png)
+![Uploading image.png…]()
