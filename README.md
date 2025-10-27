@@ -1,193 +1,429 @@
-# TP1---Docker-Docker-Compose-Exercice-4---Stack-compl-te-avec-Docker-Compose
+#  TP1 Docker – Exercise 4: FullStack Flask Application with PostgreSQL and Redis
 
-
-## 1️⃣ Créer le dossier du projet
-
-```cmd
-cd C:\Users\PC\Documents
-mkdir fullstack-app
-cd fullstack-app
-```
-
----
-<img width="717" height="202" alt="image" src="https://github.com/user-attachments/assets/96f9115f-a02d-44ce-b0f8-d167fc1ed8c1" />
-
-## 2️⃣ Structure du projet
-
-```
-fullstack-app/
-├── app/
-│   ├── app.py
-│   ├── requirements.txt
-├── docker-compose.yml
-├── .env
-```
-
-* `app/` → contient ton API Flask et le fichier des dépendances.
-* `.env` → pour les variables d’environnement.
-* `docker-compose.yml` → orchestration des services.
-
----
-
-## 3️⃣ Exemple minimal de `app.py` (Flask API)
-
-```python
-from flask import Flask, jsonify, request
-import os
+##  Objective
+This project is a complete fullstack environment that demonstrates how to build a RESTful Flask API connected to PostgreSQL for persistent data storage and Redis for caching.
+It is fully containerized using Docker Compose, with health checks, persistent volumes, and an Adminer UI for database management.
+##  Project Structure
+![e0](./images/e0.png)
+## File Contents
+###  app.py
+The main backend logic is written in Flask. It connects to PostgreSQL and Redis, provides CRUD endpoints for users, and includes caching and health checks.
+py
+from flask import Flask, request, jsonify
 import psycopg2
+from psycopg2.extras import RealDictCursor
+import redis
+import json
+import os
+from datetime import datetime
 
 app = Flask(__name__)
 
-# Connexion à PostgreSQL
-conn = psycopg2.connect(
-    host=os.environ.get('POSTGRES_HOST'),
-    database=os.environ.get('POSTGRES_DB'),
-    user=os.environ.get('POSTGRES_USER'),
-    password=os.environ.get('POSTGRES_PASSWORD')
-)
-cursor = conn.cursor()
+# Configuration depuis les variables d'environnement
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'db'),
+    'database': os.getenv('DB_NAME', 'fullstack_db'),
+    'user': os.getenv('DB_USER', 'postgres'),
+    'password': os.getenv('DB_PASSWORD', 'password'),
+    'port': os.getenv('DB_PORT', '5432')
+}
+
+REDIS_CONFIG = {
+    'host': os.getenv('REDIS_HOST', 'cache'),
+    'port': os.getenv('REDIS_PORT', 6379),
+    'db': 0
+}
+
+def get_db_connection():
+    """Établit une connexion à PostgreSQL"""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        return conn
+    except Exception as e:
+        print(f"Erreur de connexion à la base: {e}")
+        return None
+
+def get_redis_connection():
+    """Établit une connexion à Redis"""
+    try:
+        r = redis.Redis(**REDIS_CONFIG)
+        r.ping()  # Test de connexion
+        return r
+    except Exception as e:
+        print(f"Erreur de connexion à Redis: {e}")
+        return None
+
+def init_db():
+    """Initialise la base de données avec la table users"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    email VARCHAR(100) UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+            cur.close()
+            conn.close()
+            print("Base de données initialisée avec succès")
+        except Exception as e:
+            print(f"Erreur lors de l'initialisation: {e}")
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check pour vérifier la connectivité de tous les services"""
+    db_status = "healthy" if get_db_connection() else "unhealthy"
+    redis_status = "healthy" if get_redis_connection() else "unhealthy"
+    
+    return jsonify({
+        'status': 'success',
+        'services': {
+            'database': db_status,
+            'redis': redis_status
+        },
+        'timestamp': datetime.now().isoformat()
+    }), 200 if all([db_status == "healthy", redis_status == "healthy"]) else 503
 
 @app.route('/users', methods=['POST'])
 def create_user():
-    data = request.json
-    cursor.execute("INSERT INTO users (name, email) VALUES (%s, %s)", (data['name'], data['email']))
-    conn.commit()
-    return jsonify({'status': 'user created'}), 201
+    """Crée un nouvel utilisateur"""
+    data = request.get_json()
+    
+    if not data or not data.get('name') or not data.get('email'):
+        return jsonify({'error': 'Name and email are required'}), 400
+    
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            'INSERT INTO users (name, email) VALUES (%s, %s) RETURNING id, name, email, created_at',
+            (data['name'], data['email'])
+        )
+        user = cur.fetchone()
+        conn.commit()
+        
+        # Invalider le cache Redis pour la liste des utilisateurs
+        redis_conn = get_redis_connection()
+        if redis_conn:
+            redis_conn.delete('users:all')
+        
+        return jsonify({
+            'id': user[0],
+            'name': user[1],
+            'email': user[2],
+            'created_at': user[3].isoformat()
+        }), 201
+        
+    except psycopg2.IntegrityError:
+        return jsonify({'error': 'Email already exists'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
 
 @app.route('/users', methods=['GET'])
-def list_users():
-    cursor.execute("SELECT id, name, email FROM users")
-    users = cursor.fetchall()
-    return jsonify(users)
+def get_users():
+    """Récupère tous les utilisateurs avec cache Redis"""
+    # Vérifier d'abord le cache Redis
+    redis_conn = get_redis_connection()
+    if redis_conn:
+        cached_users = redis_conn.get('users:all')
+        if cached_users:
+            return jsonify(json.loads(cached_users)), 200
+    
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT id, name, email, created_at FROM users ORDER BY id')
+        users = cur.fetchall()
+        
+        # Convertir les résultats en format sérialisable
+        users_list = []
+        for user in users:
+            user_dict = dict(user)
+            user_dict['created_at'] = user_dict['created_at'].isoformat()
+            users_list.append(user_dict)
+        
+        # Mettre en cache dans Redis (expire après 30 secondes)
+        if redis_conn:
+            redis_conn.setex('users:all', 30, json.dumps(users_list))
+        
+        return jsonify(users_list), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
 
-# Ajouter GET /users/<id>, PUT /users/<id>, DELETE /users/<id> de la même façon
+@app.route('/users/<int:user_id>', methods=['GET'])
+def get_user(user_id):
+    """Récupère un utilisateur spécifique"""
+    # Vérifier le cache Redis
+    redis_conn = get_redis_connection()
+    cache_key = f'user:{user_id}'
+    if redis_conn:
+        cached_user = redis_conn.get(cache_key)
+        if cached_user:
+            return jsonify(json.loads(cached_user)), 200
+    
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT id, name, email, created_at FROM users WHERE id = %s', (user_id,))
+        user = cur.fetchone()
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        user_dict = dict(user)
+        user_dict['created_at'] = user_dict['created_at'].isoformat()
+        
+        # Mettre en cache dans Redis (expire après 60 secondes)
+        if redis_conn:
+            redis_conn.setex(cache_key, 60, json.dumps(user_dict))
+        
+        return jsonify(user_dict), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/users/<int:user_id>', methods=['PUT'])
+def update_user(user_id):
+    """Met à jour un utilisateur"""
+    data = request.get_json()
+    
+    if not data or (not data.get('name') and not data.get('email')):
+        return jsonify({'error': 'Name or email is required'}), 400
+    
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Construire la requête dynamiquement
+        update_fields = []
+        values = []
+        
+        if 'name' in data:
+            update_fields.append("name = %s")
+            values.append(data['name'])
+        if 'email' in data:
+            update_fields.append("email = %s")
+            values.append(data['email'])
+        
+        values.append(user_id)
+        query = f'UPDATE users SET {", ".join(update_fields)} WHERE id = %s RETURNING id, name, email, created_at'
+        
+        cur.execute(query, values)
+        user = cur.fetchone()
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        conn.commit()
+        
+        # Invalider les caches Redis
+        redis_conn = get_redis_connection()
+        if redis_conn:
+            redis_conn.delete('users:all')
+            redis_conn.delete(f'user:{user_id}')
+        
+        user_dict = dict(user)
+        user_dict['created_at'] = user_dict['created_at'].isoformat()
+        
+        return jsonify(user_dict), 200
+        
+    except psycopg2.IntegrityError:
+        return jsonify({'error': 'Email already exists'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/users/<int:user_id>', methods=['DELETE'])
+def delete_user(user_id):
+    """Supprime un utilisateur"""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    
+    try:
+        cur = conn.cursor()
+        cur.execute('DELETE FROM users WHERE id = %s RETURNING id', (user_id,))
+        deleted_user = cur.fetchone()
+        
+        if not deleted_user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        conn.commit()
+        
+        # Invalider les caches Redis
+        redis_conn = get_redis_connection()
+        if redis_conn:
+            redis_conn.delete('users:all')
+            redis_conn.delete(f'user:{user_id}')
+        
+        return jsonify({'message': 'User deleted successfully'}), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-```
+    # Initialiser la base au démarrage
+    init_db()
+    app.run(host='0.0.0.0', port=5000, debug=True)
 
----
 
-## 4️⃣ `requirements.txt` (dépendances Flask et PostgreSQL)
 
-```
-Flask==2.3.5
-psycopg2-binary==2.9.9
-redis==5.3.4
-```
+## Dependencies (requirements.txt)
+txt
+Flask==2.3.3
+psycopg2-binary==2.9.7
+redis==4.6.0
 
----
+### Dockerfile 
+dockerfile
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 5000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+CMD ["python", "app.py"]
 
-## 5️⃣ Exemple minimal `docker-compose.yml`
+### SQL Initialization (init.sql)
+sql
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
-```yaml
+INSERT INTO users (name, email) VALUES 
+    ('John Doe', 'john.doe@example.com'),
+    ('Jane Smith', 'jane.smith@example.com')
+ON CONFLICT (email) DO NOTHING;
+
+### DockerCompose
+yml
 version: '3.8'
 
 services:
   web:
     build: ./app
-    container_name: flask-app
-    env_file: .env
     ports:
       - "5000:5000"
+    environment:
+      - DB_HOST=db
+      - DB_NAME=fullstack_db
+      - DB_USER=postgres
+      - DB_PASSWORD=password
+      - DB_PORT=5432
+      - REDIS_HOST=cache
+      - REDIS_PORT=6379
     depends_on:
-      - db
-      - cache
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/users"]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
+      start_period: 40s
 
   db:
-    image: postgres:15-alpine
-    container_name: postgres-db
+    image: postgres:13
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      - POSTGRES_DB=fullstack_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
-      interval: 30s
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
       timeout: 5s
       retries: 5
 
   cache:
     image: redis:7-alpine
-    container_name: redis-cache
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
+      interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
 
   adminer:
     image: adminer
-    container_name: adminer
     ports:
       - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - ADMINER_DEFAULT_SERVER=db
 
 volumes:
-  db_data:
-```
+  postgres_data:
+  redis_data:
 
----
+*Explanation:*
+- web : Flask API container
+- db :PostgreSQL database
+- cache: Redis for caching user queries
+- adminer : UI for managing the PostgreSQL database
+- Volumes : Persist database and cache data
+- Health checks : Automatically verify container health
+### Run the Stack
+![e1](./images/e1.png)
+### Tests
+*Commandes*
+bash
+docker compose ps
+docker inspect --format="{{json .State.Health}}" fullstack-app-db-1
+docker inspect --format="{{json .State.Health}}" fullstack-app-cache-1
 
-## 6️⃣ `.env` (variables d’environnement)
-
-```
-POSTGRES_USER=admin
-POSTGRES_PASSWORD=secret
-POSTGRES_DB=usersdb
-POSTGRES_HOST=db
-```
-
----
-
-## 7️⃣ Construire et lancer la stack
-
-```cmd
-docker-compose up --build
-```
-
-* L’option `--build` reconstruit l’image `web` à partir de ton Dockerfile si nécessaire.
-* La stack inclut Flask, PostgreSQL, Redis et Adminer.
-
----
-<img width="1446" height="127" alt="image" src="https://github.com/user-attachments/assets/bb9a0333-8f33-4068-9f69-6083008aad41" />
-
-
-## 8️⃣ Vérifier la santé des services
-
-```cmd
-docker ps
-docker inspect --format="{{json .State.Health}}" flask-app
-docker inspect --format="{{json .State.Health}}" postgres-db
-docker inspect --format="{{json .State.Health}}" redis-cache
-```
-
----
-
-## 9️⃣ Tester les endpoints (avec Postman ou curl)
-
-```cmd
-# Créer un utilisateur
-curl -X POST -H "Content-Type: application/json" -d "{\"name\":\"Noura\",\"email\":\"noura@example.com\"}" http://localhost:5000/users
-
-# Lister les utilisateurs
-curl http://localhost:5000/users
-```
-
-* Ajouter les endpoints `GET /users/<id>`, `PUT /users/<id>`, `DELETE /users/<id>` de la même façon dans `app.py`.
-
----
-
-Si tu veux, Noura, je peux te préparer **un guide CMD complet pour l’Exercice 4**, avec toutes les commandes Windows pour créer les dossiers, fichiers, construire la stack et tester l’API rapidement.
-
-Veux‑tu que je fasse ça ?
+![e4](./images/e4.png)
+![e5](./images/e5.png)
+*test with   Postman:*
+- Create a New User
+![e3](./images/e3.png)
+- List All Users
+![e2](./images/e2.png)
